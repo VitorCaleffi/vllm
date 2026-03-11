@@ -8,8 +8,15 @@ on:
         required: false
         type: string
   push:
+    branches:
+      - main
     tags:
       - "v*"
+
+# Cancel in-flight runs on the same branch/PR — new push wins
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
