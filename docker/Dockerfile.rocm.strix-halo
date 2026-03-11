@@ -105,7 +105,12 @@ RUN apt-get update -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install build tools
-RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
+# The ROCm base image ships wheel/setuptools without RECORD files, which makes
+# pip unable to uninstall/upgrade them. Nuke the broken installs first.
+RUN rm -rf /usr/lib/python3/dist-packages/wheel* \
+           /usr/lib/python3/dist-packages/setuptools* \
+           /usr/lib/python3/dist-packages/pkg_resources \
+    && pip install packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
 
 # Install uv for fast dependency resolution
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
@@ -241,8 +246,10 @@ RUN cd /app/vllm \
 # ============================================================================
 FROM deps_installed AS final
 
-# Use --force-reinstall for pip to work around missing RECORD file from base image
-RUN pip install --force-reinstall --upgrade pip && pip install huggingface-hub[cli]
+# Nuke base image pip (no RECORD file) then install fresh pip + huggingface-hub
+RUN rm -rf /usr/lib/python3/dist-packages/pip* \
+    && python3 -m ensurepip --upgrade \
+    && pip install --upgrade pip huggingface-hub[cli]
 
 # Install vLLM from the wheel we just built
 RUN --mount=type=bind,from=build_vllm,src=/app/vllm/dist/,target=/tmp/vllm-dist \
