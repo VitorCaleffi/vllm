@@ -1,0 +1,77 @@
+name: Build & Push ROCm Strix Halo Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: "Optional image tag override (e.g. 'test-build')"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Free disk space
+        # ROCm Docker images are large (~15GB+); free space to avoid build failures
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # On manual dispatch with override
+            type=raw,value=${{ inputs.tag_override }},enable=${{ inputs.tag_override != '' }}
+            # On tag push: rocm7.2-strix-halo-v1.2.3
+            type=semver,pattern=rocm7.2-strix-halo-{{version}}
+            # Short SHA: rocm7.2-strix-halo-abc1234
+            type=sha,prefix=rocm7.2-strix-halo-
+            # Latest for Strix Halo
+            type=raw,value=rocm7.2-strix-halo-latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rocm.strix-halo
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          target: vllm-openai
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build args can be overridden via workflow_dispatch inputs if needed
+          build-args: |
+            BASE_IMAGE=rocm/dev-ubuntu-24.04:7.2-complete
