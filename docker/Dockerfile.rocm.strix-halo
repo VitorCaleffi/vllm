@@ -1,13 +1,20 @@
-# Self-contained Dockerfile for AMD Strix Halo (gfx1150/gfx1151) APUs
+# Dockerfile for AMD Strix Halo (gfx1151) APUs
 #
-# Builds PyTorch, Triton, and vLLM from source against ROCm 7.2 to guarantee
-# ABI consistency. Targets only gfx1150;gfx1151 architectures.
+# Based on kyuz0/amd-strix-halo-vllm-toolboxes — the community-proven approach
+# for running vLLM on Strix Halo. Uses TheRock ROCm SDK and nightly PyTorch
+# wheels (which include AOTriton for gfx1151) instead of building from source.
 #
 # Key differences from the upstream Dockerfile.rocm_base + Dockerfile.rocm:
 #   - Single self-contained file (vs upstream's two-file base+app split)
-#   - Targets only gfx1150;gfx1151 (not MI300/MI325/RDNA3/RDNA4)
-#   - Skips AITER, MORI, CK Flash Attention (unsupported on gfx11xx)
+#   - Uses TheRock ROCm SDK + nightly PyTorch wheels (not ROCm stable + from source)
+#   - Targets only gfx1151 (Ryzen AI Max 395 / Radeon 8060S)
+#   - Skips AITER, MORI, CK Flash Attention, amdsmi (unsupported on gfx11xx)
 #   - All Strix Halo-specific env vars and workarounds pre-configured
+#
+# References:
+#   - https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes
+#   - https://github.com/lhl/strix-halo-testing
+#   - https://strixhalo.wiki/AI/vLLM
 #
 # Build:
 #   docker build -f docker/Dockerfile.rocm.strix-halo -t vllm-strix-halo .
@@ -27,39 +34,41 @@
 #   - Docker flags: --device=/dev/kfd --device=/dev/dri --group-add video
 #                   --group-add render --security-opt seccomp=unconfined
 
-ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:7.2-complete
+ARG BASE_IMAGE=ubuntu:24.04
+ARG GFX=gfx1151
+ARG ROCM_MAJOR_VER=7
 
-# PyTorch / Triton / Flash Attention source branches
-# These should be ROCm forks that support ROCm 7.2
-ARG PYTORCH_BRANCH="89075173"
-ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
-ARG PYTORCH_VISION_BRANCH="v0.24.1"
-ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
-ARG PYTORCH_AUDIO_BRANCH="v2.9.0"
-ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
-ARG TRITON_BRANCH="57c693b6"
-ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG FA_BRANCH="0e60e394"
-ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
+# TheRock nightly PyTorch wheel index for gfx1151
+ARG PYTORCH_WHEEL_INDEX="https://rocm.nightlies.amd.com/v2-staging/gfx1151/"
 
-ARG PYTHON_VERSION=3.12
+# Flash Attention — ROCm fork, main_perf branch (per kyuz0)
+ARG FA_BRANCH="main_perf"
+ARG FA_REPO="https://github.com/ROCm/flash-attention.git"
 
 
 # ============================================================================
-# Stage 1: Base — system packages, Python, env vars
+# Stage 1: Base — system packages, TheRock ROCm SDK, Python venv
 # ============================================================================
 FROM ${BASE_IMAGE} AS base
 
-ARG PYTHON_VERSION
-ENV PYTHON_VERSION=${PYTHON_VERSION}
+ARG GFX
+ARG ROCM_MAJOR_VER
+ARG PYTORCH_WHEEL_INDEX
 
-# Target only Strix Halo GPUs
-ENV PYTORCH_ROCM_ARCH="gfx1150;gfx1151"
+ENV DEBIAN_FRONTEND=noninteractive
 
-# ROCm paths
-ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Target only Strix Halo GPU
+ENV PYTORCH_ROCM_ARCH="gfx1151"
+ENV HIP_ARCHITECTURES="gfx1151"
+ENV AMDGPU_TARGETS="gfx1151"
+
+# ROCm paths (set after tarball install)
 ENV ROCM_PATH=/opt/rocm
-ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
+ENV HIP_PLATFORM=amd
+ENV HIP_PATH=/opt/rocm
+ENV HIP_CLANG_PATH=/opt/rocm/llvm/bin
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib
 
 # Required for RCCL in ROCm 7.1+
 ENV HSA_NO_SCRATCH_RECLAIM=1
@@ -80,206 +89,210 @@ ENV HIPCC_COMPILE_FLAGS_APPEND="-mllvm --amdgpu-unroll-threshold-local=600"
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV SAFETENSORS_FAST_GPU=1
 ENV TOKENIZERS_PARALLELISM=false
+ENV ROCBLAS_USE_HIPBLASLT=1
+ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
+
+# Flash Attention: use Triton AMD backend (not CK)
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+
+# vLLM Strix Halo runtime flags
+ENV VLLM_TARGET_DEVICE=rocm
+ENV VLLM_USE_MMAP=0
+ENV VLLM_ROCM_USE_AITER=0
+ENV VLLM_ROCM_USE_AITER_MOE=0
+ENV VLLM_USE_TRITON_AWQ=1
 
 # MIOpen regression workaround
 # See: https://github.com/pytorch/pytorch/issues/169857
 ENV MIOPEN_DEBUG_CONV_DIRECT=0
 ENV MIOPEN_DEBUG_CONV_GEMM=0
 
-RUN mkdir -p /app
-WORKDIR /app
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Install system dependencies
-# Ubuntu 24.04 ships Python 3.12 by default — no deadsnakes PPA needed.
-# Remove PEP 668 marker so pip works globally (standard for Docker containers).
+# ---- System packages ----
 RUN apt-get update -y \
-    && apt-get install -y \
-        software-properties-common git curl sudo vim less wget \
-        libgfortran5 libopenmpi-dev libpci-dev \
-        sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+    && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+        git curl wget ca-certificates \
+        gcc g++ binutils make cmake ninja-build \
+        aria2 tar xz-utils vim \
+        libdrm-dev zlib1g-dev libssl-dev \
+        libnuma-dev libatomic1 \
+        libgoogle-perftools4t64 \
         libjpeg-dev libsox-dev libsox-fmt-all sox \
-        apt-transport-https ca-certificates \
-        python3 python3-dev python3-venv \
-    && rm -f /usr/lib/python*/EXTERNALLY-MANAGED \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && python3 --version && python3 -m pip --version \
+        libopenmpi-dev libpci-dev \
+        libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+        libgfortran5 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install build tools
-# The ROCm base image ships wheel/setuptools without RECORD files, which makes
-# pip unable to uninstall/upgrade them. Nuke the broken installs first.
-RUN rm -rf /usr/lib/python3/dist-packages/wheel* \
-           /usr/lib/python3/dist-packages/setuptools* \
-           /usr/lib/python3/dist-packages/pkg_resources \
-    && pip install packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
+# ---- Install TheRock ROCm SDK from nightly tarball ----
+# This installs a self-contained ROCm to /opt/rocm (same approach as kyuz0)
+RUN set -e \
+    && cd /tmp \
+    && BASE_URL="https://therock-nightly-tarball.s3.amazonaws.com" \
+    && PREFIX="therock-dist-linux-${GFX}-${ROCM_MAJOR_VER}" \
+    && KEY="$(curl -s "${BASE_URL}?list-type=2&prefix=${PREFIX}" \
+         | tr '<' '\n' \
+         | grep -o "therock-dist-linux-${GFX}-${ROCM_MAJOR_VER}\..*\.tar\.gz" \
+         | sort -V | tail -n1)" \
+    && echo "Downloading: ${KEY}" \
+    && aria2c -x 16 -s 16 -j 16 --file-allocation=none "${BASE_URL}/${KEY}" -o therock.tar.gz \
+    && mkdir -p /opt/rocm \
+    && tar xzf therock.tar.gz -C /opt/rocm --strip-components=1 \
+    && rm therock.tar.gz
 
-# Install uv for fast dependency resolution
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
-ENV UV_HTTP_TIMEOUT=500
-ENV UV_INDEX_STRATEGY="unsafe-best-match"
-ENV UV_LINK_MODE=copy
+# Detect HIP_DEVICE_LIB_PATH from installed SDK
+RUN BITCODE_PATH=$(find /opt/rocm -type d -name bitcode -print -quit) \
+    && echo "HIP_DEVICE_LIB_PATH=${BITCODE_PATH}" >> /etc/environment
+ENV HIP_DEVICE_LIB_PATH=""
+# Will be set dynamically; cmake finds it via ROCM_PATH
 
+# ---- Python venv ----
+RUN python3.12 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PIP_NO_CACHE_DIR=1
+RUN pip install --upgrade pip wheel packaging "setuptools<80" pybind11 Cython
 
-# ============================================================================
-# Stage 2: Build Triton from source
-# ============================================================================
-FROM base AS build_triton
-ARG TRITON_BRANCH
-ARG TRITON_REPO
+# ---- Install PyTorch from TheRock nightly wheels ----
+# These wheels already include AOTriton support for gfx1151.
+RUN pip install --pre --index-url ${PYTORCH_WHEEL_INDEX} \
+    torch torchaudio torchvision
 
-RUN git clone ${TRITON_REPO}
-RUN cd triton \
-    && git checkout ${TRITON_BRANCH} \
-    && if [ ! -f setup.py ]; then cd python; fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist \
-    && mkdir -p /app/install && cp dist/*.whl /app/install
-RUN if [ -d triton/python/triton_kernels ]; then \
-        pip install build && cd triton/python/triton_kernels \
-        && python3 -m build --wheel && cp dist/*.whl /app/install; \
-    fi
+# Constrain numpy<2 for compatibility (per lhl/strix-halo-testing)
+RUN pip install "numpy<2"
 
+# Verify PyTorch installation
+RUN python -c "import torch; print(f'PyTorch {torch.__version__}, ROCm {torch.version.hip}')"
 
-# NOTE: AMD SMI (amdsmi) is intentionally NOT built.
-# amdsmi_init() segfaults on gfx1151 — both lhl/strix-halo-testing and
-# kyuz0/amd-strix-halo-vllm-toolboxes skip it entirely. vLLM handles
-# this gracefully by falling back to torch.cuda for device detection
-# (see vllm/platforms/rocm.py).
-
-
-# ============================================================================
-# Stage 3: Build PyTorch, TorchVision, TorchAudio from source
-# ============================================================================
-FROM base AS build_pytorch
-ARG PYTORCH_BRANCH
-ARG PYTORCH_VISION_BRANCH
-ARG PYTORCH_AUDIO_BRANCH
-ARG PYTORCH_REPO
-ARG PYTORCH_VISION_REPO
-ARG PYTORCH_AUDIO_REPO
-
-# Build PyTorch
-RUN git clone ${PYTORCH_REPO} pytorch
-RUN cd pytorch && git checkout ${PYTORCH_BRANCH} \
-    && pip install -r requirements.txt && git submodule update --init --recursive \
-    && python3 tools/amd_build/build_amd.py \
-    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') \
-       python3 setup.py bdist_wheel --dist-dir=dist \
-    && pip install dist/*.whl
-
-# Build TorchVision
-RUN git clone ${PYTORCH_VISION_REPO} vision
-RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
-    && python3 setup.py bdist_wheel --dist-dir=dist \
-    && pip install dist/*.whl
-
-# Build TorchAudio
-RUN git clone ${PYTORCH_AUDIO_REPO} audio
-RUN cd audio && git checkout ${PYTORCH_AUDIO_BRANCH} \
-    && git submodule update --init --recursive \
-    && pip install -r requirements.txt \
-    && python3 setup.py bdist_wheel --dist-dir=dist \
-    && pip install dist/*.whl
-
-RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
-    && cp /app/vision/dist/*.whl /app/install \
-    && cp /app/audio/dist/*.whl /app/install
+RUN mkdir -p /app
+WORKDIR /app
 
 
 # ============================================================================
-# Stage 4: Build Flash Attention from source
+# Stage 2: Build Flash Attention (ROCm fork, main_perf branch)
 # ============================================================================
 FROM base AS build_fa
 ARG FA_BRANCH
 ARG FA_REPO
 
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    pip install /install/*.whl
-RUN git clone ${FA_REPO}
-# Strip gfx1xxx archs from FA build — CK Flash Attention does not support them.
-# The Triton-based flash attention backend is used at runtime instead.
-RUN cd flash-attention \
+RUN git clone ${FA_REPO} flash-attention \
+    && cd flash-attention \
     && git checkout ${FA_BRANCH} \
-    && git submodule update --init \
-    && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') \
-       python3 setup.py bdist_wheel --dist-dir=dist
-RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
+    && python setup.py bdist_wheel --dist-dir=/app/fa-dist
 
 
 # ============================================================================
-# Stage 5: Collect all dependency wheels
+# Stage 3: Build vLLM
 # ============================================================================
-FROM base AS debs
-RUN mkdir /app/debs
-RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+FROM base AS build_vllm
 
-FROM base AS deps_installed
-RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
-    pip install /install/*.whl
+# Install Flash Attention wheel
+RUN --mount=type=bind,from=build_fa,src=/app/fa-dist/,target=/tmp/fa-dist \
+    pip install /tmp/fa-dist/*.whl
 
-
-# ============================================================================
-# Stage 6: Build vLLM
-# ============================================================================
-FROM deps_installed AS build_vllm
-
+# Copy vLLM source
 COPY ./ /app/vllm/
+WORKDIR /app/vllm
 
-# Constrain numpy<2 for compatibility (per lhl/strix-halo-testing)
-RUN cd /app/vllm \
-    && pip install "numpy<2" \
-    && pip install -r requirements/rocm.txt \
-    && python3 setup.py clean --all \
-    && python3 setup.py bdist_wheel --dist-dir=dist
+# ---- Apply Strix Halo patches ----
+# Patch 1: Replace gfx1200;gfx1201 with gfx1151 in CMakeLists.txt
+RUN sed -i 's/gfx1200;gfx1201/gfx1151/' CMakeLists.txt
+
+# Patch 2: Disable amdsmi (segfaults on gfx1151) and hardcode gfx1151 detection
+# Based on kyuz0/amd-strix-halo-vllm-toolboxes/scripts/patch_strix.py
+RUN <<'PATCH_EOF'
+python -c "
+import re, glob
+from pathlib import Path
+
+# Patch vllm/platforms/__init__.py - disable amdsmi, force ROCm detection
+p = Path('vllm/platforms/__init__.py')
+if p.exists():
+    t = p.read_text()
+    t = t.replace('import amdsmi', '# import amdsmi')
+    t = re.sub(r'is_rocm = .*', 'is_rocm = True', t)
+    t = re.sub(r'if len\(amdsmi\.amdsmi_get_processor_handles\(\)\) > 0:', 'if True:', t)
+    t = t.replace('amdsmi.amdsmi_init()', 'pass')
+    t = t.replace('amdsmi.amdsmi_shut_down()', 'pass')
+    p.write_text(t)
+    print('Patched vllm/platforms/__init__.py')
+
+# Patch vllm/platforms/rocm.py - mock amdsmi, hardcode gfx1151
+p = Path('vllm/platforms/rocm.py')
+if p.exists():
+    t = p.read_text()
+    header = 'import sys\nfrom unittest.mock import MagicMock\nsys.modules[\"amdsmi\"] = MagicMock()\n'
+    t = header + t
+    p.write_text(t)
+    print('Patched vllm/platforms/rocm.py')
+
+# Patch C/C++ sources - add missing macro definitions for PyTorch nightly compat
+macro = '''
+#ifndef C10_HIP_CHECK
+#define C10_HIP_CHECK(error) do { if (error != hipSuccess) { abort(); } } while(0)
+#endif
+#ifndef C10_CUDA_CHECK
+#define C10_CUDA_CHECK(error) do { if (error != cudaSuccess) { abort(); } } while(0)
+#endif
+'''
+count = 0
+for f in glob.glob('csrc/**/*.cu', recursive=True) + glob.glob('csrc/**/*.hip', recursive=True):
+    p = Path(f)
+    t = p.read_text()
+    if 'C10_CUDA_CHECK' not in t:
+        p.write_text(macro + '\n' + t)
+        count += 1
+print(f'Patched {count} C/C++ source files with missing macros')
+"
+PATCH_EOF
+
+# ---- Build vLLM ----
+# Use ROCm Clang as the host compiler to align ABI with PyTorch (per kyuz0)
+ENV CC=/opt/rocm/llvm/bin/clang
+ENV CXX=/opt/rocm/llvm/bin/clang++
+ENV ROCM_HOME=/opt/rocm
+ENV MAX_JOBS=4
+
+RUN pip install --upgrade cmake ninja packaging wheel "setuptools-scm>=8" "setuptools<80" \
+    scikit-build-core pybind11
+
+RUN export HIP_DEVICE_LIB_PATH=$(find /opt/rocm -type d -name bitcode -print -quit) \
+    && echo "Building with HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH" \
+    && pip wheel --no-build-isolation --no-deps -w /app/vllm-dist -v .
 
 
 # ============================================================================
-# Stage 7: Final runtime image
+# Stage 4: Final runtime image
 # ============================================================================
-FROM deps_installed AS final
+FROM base AS final
 
-# Nuke base image pip (no RECORD file) then install fresh pip + huggingface-hub
-RUN rm -rf /usr/lib/python3/dist-packages/pip* \
-    && python3 -m ensurepip --upgrade \
-    && pip install --upgrade pip huggingface-hub[cli]
+# Install Flash Attention
+RUN --mount=type=bind,from=build_fa,src=/app/fa-dist/,target=/tmp/fa-dist \
+    pip install /tmp/fa-dist/*.whl
 
-# Install vLLM from the wheel we just built
-RUN --mount=type=bind,from=build_vllm,src=/app/vllm/dist/,target=/tmp/vllm-dist \
-    --mount=type=bind,from=build_vllm,src=/app/vllm/requirements/,target=/tmp/vllm-reqs \
-    pip install -r /tmp/vllm-reqs/rocm.txt \
-    && pip install /tmp/vllm-dist/*.whl
+# Install vLLM
+RUN --mount=type=bind,from=build_vllm,src=/app/vllm-dist/,target=/tmp/vllm-dist \
+    pip install /tmp/vllm-dist/*.whl
+
+# Install additional runtime dependencies
+RUN pip install huggingface-hub[cli] hf_transfer ray
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # Copy benchmarks and examples
 COPY benchmarks /app/vllm/benchmarks
 COPY examples /app/vllm/examples
-
-# Enable fast downloads from HF
-RUN pip install hf_transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # Workaround for ROCm profiler limits
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > /app/libkineto.conf
 ENV KINETO_CONFIG="/app/libkineto.conf"
 
 # Record build metadata
-ARG BASE_IMAGE
-ARG PYTORCH_BRANCH
-ARG TRITON_BRANCH
-ARG FA_BRANCH
-RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
-    && echo "PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}" >> /app/versions.txt \
-    && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
-    && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
-    && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
-    && echo "Build type: Strix Halo (from source)" >> /app/versions.txt \
-    && python3 -c "import torch; print(f'PyTorch: {torch.__version__}')" >> /app/versions.txt \
-    && python3 -c "import triton; print(f'Triton: {triton.__version__}')" >> /app/versions.txt \
-    && python3 -c "import vllm; print(f'vLLM: {vllm.__version__}')" >> /app/versions.txt || true
+ARG GFX
+ARG ROCM_MAJOR_VER
+RUN echo "Build type: Strix Halo (TheRock ROCm SDK)" > /app/versions.txt \
+    && echo "Target GPU: ${GFX}" >> /app/versions.txt \
+    && echo "ROCm major version: ${ROCM_MAJOR_VER}" >> /app/versions.txt \
+    && python -c "import torch; print(f'PyTorch: {torch.__version__}')" >> /app/versions.txt \
+    && python -c "import triton; print(f'Triton: {triton.__version__}')" >> /app/versions.txt \
+    && python -c "import vllm; print(f'vLLM: {vllm.__version__}')" >> /app/versions.txt || true
 
 CMD ["/bin/bash"]
 
