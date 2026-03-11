@@ -21,7 +21,7 @@
 #
 # Host requirements:
 #   - Linux kernel >= 6.18.4 (older kernels have KFD bugs for Strix Halo)
-#   - Avoid linux-firmware-20251125 (breaks ROCm)
+#   - Avoid linux-firmware-20251125 (breaks ROCm); use 20260110 or later
 #   - Kernel boot params: iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856
 #   - BIOS GPU memory set to minimum (512MB); use GTT/TTM for unified memory
 #   - Docker flags: --device=/dev/kfd --device=/dev/dri --group-add video
@@ -66,6 +66,8 @@ ENV HSA_NO_SCRATCH_RECLAIM=1
 
 # Required for AOTriton experimental kernels on gfx1151
 ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+# Prefer default AOTriton kernels (recommended by lhl/strix-halo-testing)
+ENV TORCH_ROCM_AOTRITON_PREFER_DEFAULT=1
 
 # Use gloo backend — NCCL is unstable on single-GPU APUs
 ENV VLLM_DISTRIBUTED_BACKEND=gloo
@@ -138,20 +140,15 @@ RUN if [ -d triton/python/triton_kernels ]; then \
     fi
 
 
-# ============================================================================
-# Stage 3: Build AMD SMI
-# ============================================================================
-FROM base AS build_amdsmi
-
-# NOTE: amdsmi_init() can segfault on gfx1151 — vLLM handles this gracefully
-# by falling back to torch.cuda for device detection (see vllm/platforms/rocm.py)
-RUN cd /opt/rocm/share/amd_smi \
-    && pip wheel . --wheel-dir=dist
-RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
+# NOTE: AMD SMI (amdsmi) is intentionally NOT built.
+# amdsmi_init() segfaults on gfx1151 — both lhl/strix-halo-testing and
+# kyuz0/amd-strix-halo-vllm-toolboxes skip it entirely. vLLM handles
+# this gracefully by falling back to torch.cuda for device detection
+# (see vllm/platforms/rocm.py).
 
 
 # ============================================================================
-# Stage 4: Build PyTorch, TorchVision, TorchAudio from source
+# Stage 3: Build PyTorch, TorchVision, TorchAudio from source
 # ============================================================================
 FROM base AS build_pytorch
 ARG PYTORCH_BRANCH
@@ -190,7 +187,7 @@ RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
 
 
 # ============================================================================
-# Stage 5: Build Flash Attention from source
+# Stage 4: Build Flash Attention from source
 # ============================================================================
 FROM base AS build_fa
 ARG FA_BRANCH
@@ -210,15 +207,13 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 
 # ============================================================================
-# Stage 6: Collect all dependency wheels
+# Stage 5: Collect all dependency wheels
 # ============================================================================
 FROM base AS debs
 RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
@@ -229,20 +224,22 @@ RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
 
 
 # ============================================================================
-# Stage 7: Build vLLM
+# Stage 6: Build vLLM
 # ============================================================================
 FROM deps_installed AS build_vllm
 
 COPY ./ /app/vllm/
 
+# Constrain numpy<2 for compatibility (per lhl/strix-halo-testing)
 RUN cd /app/vllm \
+    && pip install "numpy<2" \
     && pip install -r requirements/rocm.txt \
     && python3 setup.py clean --all \
     && python3 setup.py bdist_wheel --dist-dir=dist
 
 
 # ============================================================================
-# Stage 8: Final runtime image
+# Stage 7: Final runtime image
 # ============================================================================
 FROM deps_installed AS final
 
