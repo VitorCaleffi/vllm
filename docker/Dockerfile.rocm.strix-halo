@@ -156,9 +156,6 @@ RUN pip install --upgrade pip wheel packaging "setuptools<80" pybind11 Cython
 RUN pip install --pre --index-url ${PYTORCH_WHEEL_INDEX} \
     torch torchaudio torchvision
 
-# Constrain numpy<2 for compatibility (per lhl/strix-halo-testing)
-RUN pip install "numpy<2"
-
 # Verify PyTorch installation
 RUN python -c "import torch; print(f'PyTorch {torch.__version__}, ROCm {torch.version.hip}')"
 
