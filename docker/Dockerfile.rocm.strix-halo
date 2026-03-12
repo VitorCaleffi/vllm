@@ -107,10 +107,6 @@ ENV VLLM_USE_TRITON_AWQ=1
 ENV MIOPEN_DEBUG_CONV_DIRECT=0
 ENV MIOPEN_DEBUG_CONV_GEMM=0
 
-# Preload tcmalloc (fixes double-free shutdown crash) and librocm_smi64
-# See: kyuz0/amd-strix-halo-vllm-toolboxes install_rocm_sdk.sh
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/rocm/lib/librocm_smi64.so.1.0
-
 # ---- System packages ----
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
@@ -295,6 +291,10 @@ COPY examples /app/vllm/examples
 # Workaround for ROCm profiler limits
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > /app/libkineto.conf
 ENV KINETO_CONFIG="/app/libkineto.conf"
+
+# Preload tcmalloc (fixes double-free shutdown crash) and librocm_smi64
+# See: kyuz0/amd-strix-halo-vllm-toolboxes install_rocm_sdk.sh
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/rocm/lib/librocm_smi64.so.1.0
 
 # Record build metadata
 ARG GFX
